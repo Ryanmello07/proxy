@@ -45,6 +45,7 @@ func main() {
 		platformURL string
 		userAuth    string
 		password    string
+		byJwt       string
 		providerID  string
 		city        string
 		country     string
@@ -64,28 +65,32 @@ func main() {
 				Usage:       "API URL",
 				EnvVars:     []string{"API_URL"},
 				Destination: &cfg.apiURL,
-				Value:       "https://api.bringyour.com",
+				Value:       "http://74.50.11.113:8080",
 			},
 			&cli.StringFlag{
 				Name:        "platform-url",
 				Usage:       "Platform URL",
 				EnvVars:     []string{"PLATFORM_URL"},
 				Destination: &cfg.platformURL,
-				Value:       "wss://connect.bringyour.com",
+				Value:       "ws://74.50.11.113:5080",
 			},
 			&cli.StringFlag{
 				Name:        "user-auth",
 				Usage:       "User auth",
 				EnvVars:     []string{"USER_AUTH"},
 				Destination: &cfg.userAuth,
-				Required:    true,
 			},
 			&cli.StringFlag{
 				Name:        "password",
 				Usage:       "Password",
 				EnvVars:     []string{"PASSWORD"},
 				Destination: &cfg.password,
-				Required:    true,
+			},
+			&cli.StringFlag{
+				Name:        "by-jwt",
+				Usage:       "Authenticate with a dashboard-provided JWT instead of user-auth/password",
+				EnvVars:     []string{"BY_JWT"},
+				Destination: &cfg.byJwt,
 			},
 			&cli.StringFlag{
 				Name:        "provider-id",
@@ -117,9 +122,19 @@ func main() {
 
 			ctx := c.Context
 
-			jwt, err := login(ctx, cfg.apiURL, cfg.userAuth, cfg.password)
-			if err != nil {
-				return fmt.Errorf("login failed: %w", err)
+			jwt := cfg.byJwt
+			if jwt == "" {
+				if cfg.userAuth == "" {
+					return errors.New("either --by-jwt or --user-auth is required")
+				}
+				if cfg.password == "" {
+					return errors.New("either --by-jwt or --password is required")
+				}
+				var err error
+				jwt, err = login(ctx, cfg.apiURL, cfg.userAuth, cfg.password)
+				if err != nil {
+					return fmt.Errorf("login failed: %w", err)
+				}
 			}
 
 			locations, err := getProviderLocations(
