@@ -137,24 +137,35 @@ func main() {
 				}
 			}
 
-			locations, err := getProviderLocations(
-				ctx,
-				cfg.apiURL,
-				jwt,
-			)
-			if err != nil {
-				return fmt.Errorf("get locations failed: %w", err)
-			}
+			providersSpec, err := func() ([]*connect.ProviderSpec, error) {
+				if cfg.providerID != "" {
+					cid, err := connect.ParseId(cfg.providerID)
+					if err != nil {
+						return nil, fmt.Errorf("parse provider id failed: %w", err)
+					}
+					fmt.Println("provider match", cid)
+					return []*connect.ProviderSpec{{ClientId: &cid}}, nil
+				}
 
-			providersSpec, err := getProviderSpec(
-				locations,
-				cfg.city,
-				cfg.country,
-				cfg.region,
-				cfg.providerID,
-			)
+				locations, err := getProviderLocations(
+					ctx,
+					cfg.apiURL,
+					jwt,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("get locations failed: %w", err)
+				}
+
+				return getProviderSpec(
+					locations,
+					cfg.city,
+					cfg.country,
+					cfg.region,
+					"",
+				)
+			}()
 			if err != nil {
-				return fmt.Errorf("get provider spec failed: %w", err)
+				return err
 			}
 
 			clientJWT, err := authNetworkClient(
