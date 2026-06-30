@@ -50,6 +50,8 @@ func main() {
 		city        string
 		country     string
 		region      string
+		socksUser   string
+		socksPass   string
 	}{}
 	app := &cli.App{
 		Flags: []cli.Flag{
@@ -115,6 +117,19 @@ func main() {
 				Usage:       "Region",
 				EnvVars:     []string{"REGION"},
 				Destination: &cfg.region,
+			},
+			&cli.StringFlag{
+				Name:        "socks-user",
+				Usage:       "SOCKS5 username",
+				EnvVars:     []string{"SOCKS_USER"},
+				Destination: &cfg.socksUser,
+				Value:       "urnetwork",
+			},
+			&cli.StringFlag{
+				Name:        "socks-pass",
+				Usage:       "SOCKS5 password",
+				EnvVars:     []string{"SOCKS_PASS"},
+				Destination: &cfg.socksPass,
 			},
 		},
 		Name: "socksproxy",
@@ -248,6 +263,13 @@ func main() {
 
 			server := socks5.NewServer(
 				socks5.WithLogger(socks5.NewLogger(log.New(os.Stdout, "socks5: ", log.LstdFlags))),
+				socks5.WithAuthMethods([]socks5.Authenticator{
+					socks5.UserPassAuthenticator{
+						Credentials: socks5.StaticCredentials{
+							cfg.socksUser: cfg.socksPass,
+						},
+					},
+				}),
 				socks5.WithDialAndRequest(func(ctx context.Context, network, addr string, request *socks5.Request) (net.Conn, error) {
 
 					fmt.Println("Dialing", network, addr, request.RawDestAddr.FQDN)
