@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	// "net/netip"
 	"flag"
@@ -15,10 +14,10 @@ import (
 
 	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/samber/lo"
-	"github.com/things-go/go-socks5"
 	"github.com/urfave/cli/v2"
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/protocol"
+	"github.com/urnetwork/proxy"
 )
 
 // this value is set via the linker, e.g.
@@ -261,29 +260,16 @@ func main() {
 				}
 			}()
 
-			server := socks5.NewServer(
-				socks5.WithLogger(socks5.NewLogger(log.New(os.Stdout, "socks5: ", log.LstdFlags))),
-				socks5.WithAuthMethods([]socks5.Authenticator{
-					socks5.UserPassAuthenticator{
-						Credentials: socks5.StaticCredentials{
-							cfg.socksUser: cfg.socksPass,
-						},
-					},
-				}),
-				socks5.WithDialAndRequest(func(ctx context.Context, network, addr string, request *socks5.Request) (net.Conn, error) {
+			socksProxy := proxy.NewSocksProxyWithDefaults()
+			socksProxy.ValidUser = func(user string, password string, userAddr string) bool {
+				return user == cfg.socksUser && password == cfg.socksPass
+			}
+			socksProxy.ConnectDialWithRequest = func(ctx context.Context, r proxy.SocksRequest, network string, addr string) (net.Conn, error) {
+				fmt.Println("Dialing", network, addr, r.DestAddr.FQDN)
+				return dev.DialContext(ctx, network, addr)
+			}
 
-					fmt.Println("Dialing", network, addr, request.RawDestAddr.FQDN)
-
-					// ap, err := netip.ParseAddrPort(addr)
-					// if err != nil {
-					// 	return nil, err
-					// }
-
-					return dev.DialContext(ctx, "tcp", addr)
-				}),
-			)
-
-			go server.ListenAndServe("tcp", cfg.addr)
+			go socksProxy.ListenAndServe(ctx, "tcp", cfg.addr)
 
 			fmt.Printf("socks5 server is listening on %s\n", cfg.addr)
 
@@ -445,6 +431,9 @@ func login(ctx context.Context, apiURL, userAuth, password string) (string, erro
 	)
 
 	res := <-resChan
+	if res.err != nil {
+		return "", res.err
+	}
 	if res.res.Error != nil {
 		return "", errors.New(res.res.Error.Message)
 	}
