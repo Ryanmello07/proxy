@@ -8,13 +8,14 @@ import (
 	// "net/netip"
 	"flag"
 	"os"
+	"os/signal"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/docopt/docopt-go"
 	gojwt "github.com/golang-jwt/jwt/v5"
-	"github.com/samber/lo"
-	"github.com/urfave/cli/v2"
 	"github.com/urnetwork/connect"
 	"github.com/urnetwork/connect/protocol"
 	"github.com/urnetwork/proxy"
@@ -44,243 +45,194 @@ func main() {
 		platformURL string
 		userAuth    string
 		password    string
-		byJwt       string
 		providerID  string
 		city        string
 		country     string
 		region      string
-		socksUser   string
-		socksPass   string
 	}{}
-	app := &cli.App{
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:        "addr",
-				Usage:       "Socks5 server address",
-				EnvVars:     []string{"ADDR"},
-				Destination: &cfg.addr,
-				Value:       ":9999",
-			},
-			&cli.StringFlag{
-				Name:        "api-url",
-				Usage:       "API URL",
-				EnvVars:     []string{"API_URL"},
-				Destination: &cfg.apiURL,
-				Value:       "http://74.50.11.113:8080",
-			},
-			&cli.StringFlag{
-				Name:        "platform-url",
-				Usage:       "Platform URL",
-				EnvVars:     []string{"PLATFORM_URL"},
-				Destination: &cfg.platformURL,
-				Value:       "ws://74.50.11.113:5080",
-			},
-			&cli.StringFlag{
-				Name:        "user-auth",
-				Usage:       "User auth",
-				EnvVars:     []string{"USER_AUTH"},
-				Destination: &cfg.userAuth,
-			},
-			&cli.StringFlag{
-				Name:        "password",
-				Usage:       "Password",
-				EnvVars:     []string{"PASSWORD"},
-				Destination: &cfg.password,
-			},
-			&cli.StringFlag{
-				Name:        "by-jwt",
-				Usage:       "Authenticate with a dashboard-provided JWT instead of user-auth/password",
-				EnvVars:     []string{"BY_JWT"},
-				Destination: &cfg.byJwt,
-			},
-			&cli.StringFlag{
-				Name:        "provider-id",
-				Usage:       "Provider ID",
-				EnvVars:     []string{"PROVIDER_ID"},
-				Destination: &cfg.providerID,
-			},
-			&cli.StringFlag{
-				Name:        "city",
-				Usage:       "City",
-				EnvVars:     []string{"CITY"},
-				Destination: &cfg.city,
-			},
-			&cli.StringFlag{
-				Name:        "country",
-				Usage:       "Country",
-				EnvVars:     []string{"COUNTRY"},
-				Destination: &cfg.country,
-			},
-			&cli.StringFlag{
-				Name:        "region",
-				Usage:       "Region",
-				EnvVars:     []string{"REGION"},
-				Destination: &cfg.region,
-			},
-			&cli.StringFlag{
-				Name:        "socks-user",
-				Usage:       "SOCKS5 username",
-				EnvVars:     []string{"SOCKS_USER"},
-				Destination: &cfg.socksUser,
-				Value:       "urnetwork",
-			},
-			&cli.StringFlag{
-				Name:        "socks-pass",
-				Usage:       "SOCKS5 password",
-				EnvVars:     []string{"SOCKS_PASS"},
-				Destination: &cfg.socksPass,
-			},
-		},
-		Name: "socksproxy",
-		Action: func(c *cli.Context) error {
+	usage := `socksproxy - dev socks5 proxy over urnetwork.
 
-			ctx := c.Context
+Usage:
+    socksproxy [options]
 
-			jwt := cfg.byJwt
-			if jwt == "" {
-				if cfg.userAuth == "" {
-					return errors.New("either --by-jwt or --user-auth is required")
-				}
-				if cfg.password == "" {
-					return errors.New("either --by-jwt or --password is required")
-				}
-				var err error
-				jwt, err = login(ctx, cfg.apiURL, cfg.userAuth, cfg.password)
-				if err != nil {
-					return fmt.Errorf("login failed: %w", err)
-				}
-			}
+Options:
+    --addr=<addr>                  socks5 server address (env ADDR, default :9999)
+    --api-url=<api-url>            api url (env API_URL, default https://api.bringyour.com)
+    --platform-url=<platform-url>  platform url (env PLATFORM_URL, default wss://connect.bringyour.com)
+    --user-auth=<user-auth>        user auth, required (env USER_AUTH)
+    --password=<password>          password, required (env PASSWORD)
+    --provider-id=<provider-id>    provider id (env PROVIDER_ID)
+    --city=<city>                  city (env CITY)
+    --country=<country>            country (env COUNTRY)
+    --region=<region>              region (env REGION)
+    -h --help                      show this help.`
 
-			providersSpec, err := func() ([]*connect.ProviderSpec, error) {
-				if cfg.providerID != "" {
-					cid, err := connect.ParseId(cfg.providerID)
-					if err != nil {
-						return nil, fmt.Errorf("parse provider id failed: %w", err)
-					}
-					fmt.Println("provider match", cid)
-					return []*connect.ProviderSpec{{ClientId: &cid}}, nil
-				}
-
-				locations, err := getProviderLocations(
-					ctx,
-					cfg.apiURL,
-					jwt,
-				)
-				if err != nil {
-					return nil, fmt.Errorf("get locations failed: %w", err)
-				}
-
-				return getProviderSpec(
-					locations,
-					cfg.city,
-					cfg.country,
-					cfg.region,
-					"",
-				)
-			}()
-			if err != nil {
-				return err
-			}
-
-			clientJWT, err := authNetworkClient(
-				ctx,
-				cfg.apiURL,
-				jwt,
-				&connect.AuthNetworkClientArgs{
-					Description: "my device",
-					DeviceSpec:  "socks5",
-				},
-			)
-
-			if err != nil {
-				return fmt.Errorf("auth network client failed: %w", err)
-			}
-
-			clientID, err := parseByJwtClientId(clientJWT)
-			if err != nil {
-				return fmt.Errorf("parse byJwt client id failed: %w", err)
-			}
-
-			fmt.Println("my clientID:", clientID)
-
-			generator := connect.NewApiMultiClientGenerator(
-				ctx,
-				providersSpec,
-				connect.NewClientStrategyWithDefaults(ctx),
-				// exclude self
-				[]connect.Id{
-					clientID,
-				},
-				cfg.apiURL,
-				clientJWT,
-				cfg.platformURL,
-				"my device",
-				"socks5",
-				"0.0.0",
-				&clientID,
-				// connect.DefaultClientSettingsNoNetworkEvents,
-				connect.DefaultClientSettings,
-				connect.DefaultApiMultiClientGeneratorSettings(),
-			)
-
-			dev, err := connect.CreateTunWithDefaults(ctx)
-			if err != nil {
-				return fmt.Errorf("create net tun failed: %w", err)
-			}
-
-			mc := connect.NewRemoteUserNatMultiClientWithDefaults(
-				ctx,
-				generator,
-				func(source connect.TransferPath, provideMode protocol.ProvideMode, ipPath *connect.IpPath, packet []byte) {
-					_, err := dev.Write(packet)
-					if err != nil {
-						fmt.Println("packet write error:", err)
-					}
-				},
-				protocol.ProvideMode_Network,
-			)
-
-			source := connect.SourceId(clientID)
-
-			go func() {
-				for {
-					packet, err := dev.Read()
-					if err == nil {
-						mc.SendPacket(
-							source,
-							protocol.ProvideMode_Network,
-							packet,
-							time.Second*15,
-						)
-					}
-					if err != nil {
-						fmt.Println("read error:", err)
-						return
-					}
-				}
-			}()
-
-			socksProxy := proxy.NewSocksProxyWithDefaults()
-			socksProxy.ValidUser = func(user string, password string, userAddr string) bool {
-				return user == cfg.socksUser && password == cfg.socksPass
-			}
-			socksProxy.ConnectDialWithRequest = func(ctx context.Context, r proxy.SocksRequest, network string, addr string) (net.Conn, error) {
-				fmt.Println("Dialing", network, addr, r.DestAddr.FQDN)
-				return dev.DialContext(ctx, network, addr)
-			}
-
-			go socksProxy.ListenAndServe(ctx, "tcp", cfg.addr)
-
-			fmt.Printf("socks5 server is listening on %s\n", cfg.addr)
-
-			<-ctx.Done()
-
-			return nil
-
-		},
+	opts, err := docopt.ParseArgs(usage, os.Args[1:], Version)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-	app.RunAndExitOnError()
+	// a flag value, or its env var fallback, or the hardcoded default -- matches
+	// the previous cli EnvVars/Value behavior. docopt has no native env support.
+	optStr := func(name string) string {
+		if s, ok := opts[name].(string); ok {
+			return s
+		}
+		return ""
+	}
+	pick := func(optName string, envName string, def string) string {
+		if v := optStr(optName); v != "" {
+			return v
+		}
+		if v := os.Getenv(envName); v != "" {
+			return v
+		}
+		return def
+	}
+	cfg.addr = pick("--addr", "ADDR", ":9999")
+	cfg.apiURL = pick("--api-url", "API_URL", "https://api.bringyour.com")
+	cfg.platformURL = pick("--platform-url", "PLATFORM_URL", "wss://connect.bringyour.com")
+	cfg.userAuth = pick("--user-auth", "USER_AUTH", "")
+	cfg.password = pick("--password", "PASSWORD", "")
+	cfg.providerID = pick("--provider-id", "PROVIDER_ID", "")
+	cfg.city = pick("--city", "CITY", "")
+	cfg.country = pick("--country", "COUNTRY", "")
+	cfg.region = pick("--region", "REGION", "")
+	if cfg.userAuth == "" || cfg.password == "" {
+		fmt.Fprintln(os.Stderr, "--user-auth and --password are required (or set USER_AUTH / PASSWORD)")
+		os.Exit(1)
+	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	run := func() error {
+
+		jwt, err := login(ctx, cfg.apiURL, cfg.userAuth, cfg.password)
+		if err != nil {
+			return fmt.Errorf("login failed: %w", err)
+		}
+
+		locations, err := getProviderLocations(
+			ctx,
+			cfg.apiURL,
+			jwt,
+		)
+		if err != nil {
+			return fmt.Errorf("get locations failed: %w", err)
+		}
+
+		providersSpec, err := getProviderSpec(
+			locations,
+			cfg.city,
+			cfg.country,
+			cfg.region,
+			cfg.providerID,
+		)
+		if err != nil {
+			return fmt.Errorf("get provider spec failed: %w", err)
+		}
+
+		clientJWT, err := authNetworkClient(
+			ctx,
+			cfg.apiURL,
+			jwt,
+			&connect.AuthNetworkClientArgs{
+				Description: "my device",
+				DeviceSpec:  "socks5",
+			},
+		)
+
+		if err != nil {
+			return fmt.Errorf("auth network client failed: %w", err)
+		}
+
+		clientID, err := parseByJwtClientId(clientJWT)
+		if err != nil {
+			return fmt.Errorf("parse byJwt client id failed: %w", err)
+		}
+
+		fmt.Println("my clientID:", clientID)
+
+		generator := connect.NewApiMultiClientGenerator(
+			ctx,
+			providersSpec,
+			connect.NewClientStrategyWithDefaults(ctx),
+			// exclude self
+			[]connect.Id{
+				clientID,
+			},
+			cfg.apiURL,
+			clientJWT,
+			cfg.platformURL,
+			"my device",
+			"socks5",
+			"0.0.0",
+			&clientID,
+			// connect.DefaultClientSettingsNoNetworkEvents,
+			connect.DefaultClientSettings,
+			connect.DefaultApiMultiClientGeneratorSettings(),
+		)
+
+		dev, err := connect.CreateTunWithDefaults(ctx)
+		if err != nil {
+			return fmt.Errorf("create net tun failed: %w", err)
+		}
+
+		mc := connect.NewRemoteUserNatMultiClientWithDefaults(
+			ctx,
+			generator,
+			func(source connect.TransferPath, provideMode protocol.ProvideMode, ipPath *connect.IpPath, packet []byte) {
+				_, err := dev.Write(packet)
+				if err != nil {
+					fmt.Println("packet write error:", err)
+				}
+			},
+			protocol.ProvideMode_Network,
+		)
+
+		source := connect.SourceId(clientID)
+
+		go func() {
+			for {
+				packet, err := dev.Read()
+				if err == nil {
+					mc.SendPacket(
+						source,
+						protocol.ProvideMode_Network,
+						packet,
+						time.Second*15,
+					)
+				}
+				if err != nil {
+					fmt.Println("read error:", err)
+					return
+				}
+			}
+		}()
+
+		socksProxy := proxy.NewSocksProxyWithDefaults()
+		// a dev tool: any credentials are accepted
+		socksProxy.ValidUser = func(user string, password string, userAddr string) bool {
+			return true
+		}
+		socksProxy.ConnectDialWithRequest = func(ctx context.Context, r proxy.SocksRequest, network string, addr string) (net.Conn, error) {
+			fmt.Println("Dialing", network, addr, r.DestAddr.FQDN)
+			return dev.DialContext(ctx, network, addr)
+		}
+
+		go socksProxy.ListenAndServe(ctx, "tcp", cfg.addr)
+
+		fmt.Printf("socks5 server is listening on %s\n", cfg.addr)
+
+		<-ctx.Done()
+
+		return nil
+	}
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
 
 func getProviderSpec(
@@ -362,28 +314,28 @@ func getProviderSpec(
 		}
 	}
 
-	regions := lo.Filter(locations.Locations.Values(), func(v *LocationResult, _ int) bool {
+	regions := filter(locations.Locations.Values(), func(v *LocationResult) bool {
 		return v.LocationType == "region"
 	})
 
-	cities := lo.Filter(locations.Locations.Values(), func(v *LocationResult, _ int) bool {
+	cities := filter(locations.Locations.Values(), func(v *LocationResult) bool {
 		return v.LocationType == "city"
 	})
 
-	countries := lo.Filter(locations.Locations.Values(), func(v *LocationResult, _ int) bool {
+	countries := filter(locations.Locations.Values(), func(v *LocationResult) bool {
 		return v.LocationType == "country"
 	})
 
 	uniqNames := func(locations []*LocationResult) []string {
-		names := lo.Map(locations, func(v *LocationResult, _ int) string {
+		names := mapSlice(locations, func(v *LocationResult) string {
 			return v.Name
 		})
 		slices.Sort(names)
-		return lo.Uniq(names)
+		return slices.Compact(names)
 	}
 
 	prefixEach := func(prefix string, names []string) []string {
-		return lo.Map(names, func(v string, _ int) string {
+		return mapSlice(names, func(v string) string {
 			return prefix + v
 		})
 	}
@@ -527,4 +479,24 @@ func parseByJwtClientId(byJwt string) (connect.Id, error) {
 	default:
 		return connect.Id{}, fmt.Errorf("byJwt hav invalid type for client_id: %T", v)
 	}
+}
+
+// filter returns the elements of s for which keep returns true, in order.
+func filter[T any](s []T, keep func(T) bool) []T {
+	result := make([]T, 0, len(s))
+	for _, v := range s {
+		if keep(v) {
+			result = append(result, v)
+		}
+	}
+	return result
+}
+
+// mapSlice returns a new slice with f applied to each element of s.
+func mapSlice[T any, R any](s []T, f func(T) R) []R {
+	result := make([]R, len(s))
+	for i, v := range s {
+		result[i] = f(v)
+	}
+	return result
 }
