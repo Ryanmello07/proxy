@@ -223,6 +223,59 @@ Options:
 
 		go socksProxy.ListenAndServe(ctx, "tcp", cfg.addr)
 
+		// Periodic reliability readout, mirroring the Android developer
+		// screen as server logs. Every reliability regression found on the
+		// client this cycle was caught by these counters rather than by user
+		// reports: blast radius says how many flows one exit loss destroys
+		// (a 484-connection teardown read as a 35s browser stall), recovery
+		// says how long those destinations stayed dark, and the exit list
+		// shows concentration building before it becomes a mass teardown. A
+		// hang report without this readout cannot distinguish a provider
+		// problem from a detector false positive -- which was the actual
+		// cause last time. Changed-only, so an idle proxy logs nothing.
+		go func() {
+			ticker := time.NewTicker(60 * time.Second)
+			defer ticker.Stop()
+			var lastFlowsOpened uint64
+			var lastExitLossEvents uint64
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+
+				m := mc.ReliabilityMetrics()
+				if m.FlowsOpened == lastFlowsOpened && m.ExitLossEvents == lastExitLossEvents {
+					continue
+				}
+				lastFlowsOpened = m.FlowsOpened
+				lastExitLossEvents = m.ExitLossEvents
+
+				exitSummary := []string{}
+				for _, exit := range mc.Exits() {
+					id := exit.ClientId.String()
+					exitSummary = append(exitSummary, fmt.Sprintf(
+						"%s[%s]=%d", id[len(id)-8:], exit.WindowType.RankMode(), exit.FlowCount,
+					))
+				}
+
+				fmt.Printf(
+					"[reliability]flows=%d exitLoss=%d(worst %d, mean %.1f) recovery=%d/%d(mean %dms, max %dms) pending=%d exits=%s\n",
+					m.FlowsOpened,
+					m.ExitLossEvents,
+					m.MaxFlowsLostInOneEvent,
+					m.MeanFlowsLostPerExitLoss,
+					m.RecoveryCount,
+					m.RecoveryCount+m.RecoveryMissed,
+					m.RecoveryMeanNanos/int64(time.Millisecond),
+					m.RecoveryMaxNanos/int64(time.Millisecond),
+					m.RecoveryPending,
+					strings.Join(exitSummary, " "),
+				)
+			}
+		}()
+
 		fmt.Printf("socks5 server is listening on %s\n", cfg.addr)
 
 		<-ctx.Done()
