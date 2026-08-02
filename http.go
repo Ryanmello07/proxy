@@ -26,10 +26,10 @@ import (
 // socks path.
 var discardLog = log.New(io.Discard, "", 0)
 
-// minProxyConnectTimeout floors the dial backoff. `connect.NewReconnect(0)`
-// yields an already-closed channel, so a zero ProxyConnectTimeout (the struct's
-// zero value, and `NewHttpProxy`'s default) would turn the dial retry into a hot
-// spin that pegs a core.
+// minProxyConnectTimeout floors the dial backoff.
+// `connect.NewPacedReconnect(0)` yields an already-closed channel, so a zero
+// ProxyConnectTimeout (the struct's zero value, and `NewHttpProxy`'s default)
+// would turn the dial retry into a hot spin that pegs a core.
 const minProxyConnectTimeout = 1 * time.Second
 
 // maxEarlyClientBytes bounds what a client may send ahead of an established
@@ -354,7 +354,7 @@ func (self *HttpProxy) handleHttps(w http.ResponseWriter, r *http.Request) {
 	// r.URL.Host contains both the host and port (if specified)
 	var proxyConn net.Conn
 	for {
-		reconnect := connect.NewReconnect(self.proxyConnectTimeout())
+		reconnect := connect.NewPacedReconnect(self.proxyConnectTimeout())
 		proxyConn, err = self.ConnectDialWithRequest(r, "tcp", r.URL.Host)
 		if err == nil {
 			break
@@ -442,7 +442,7 @@ func (self *HttpProxy) handleHttp(w http.ResponseWriter, r *http.Request) {
 	for {
 		dialFailed.Store(false)
 		r2 := cloneProxyRequest(handleCtx, r, bodyBytes)
-		reconnect := connect.NewReconnect(self.proxyConnectTimeout())
+		reconnect := connect.NewPacedReconnect(self.proxyConnectTimeout())
 		response, err = tr.RoundTrip(r2)
 		if err == nil {
 			break
