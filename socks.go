@@ -68,9 +68,16 @@ type SocksProxy struct {
 	// counters are the only observability the data path has, since it never logs.
 	//
 	// Building it lazily rather than in the constructor is what lets a caller adjust
-	// Settings() after construction and still have it take effect.
-	serverOnce   sync.Once
-	server       *socksServer
+	// Settings() after construction and still have it take effect. The freeze point
+	// is the first build — ensureServer — not serving start.
+	//
+	// serverMu guards both serverOnce and server so a read-only accessor can check
+	// whether the server exists without building it (building would freeze the
+	// configuration mid-setup). Once built, server is never replaced.
+	serverOnce sync.Once
+	serverMu   sync.Mutex
+	server     *socksServer
+
 	statsLogOnce sync.Once
 
 	ConnectDialWithRequest func(ctx context.Context, r SocksRequest, network string, addr string) (net.Conn, error)
@@ -101,8 +108,13 @@ func (self *SocksProxy) logger() connect.Logger {
 // Stats returns the socks data path's counters. Nothing on that path logs — a
 // client picks the rate, so logging would let it drive unbounded server I/O — so
 // these counters are how drops, dial failures and oversize datagrams are observed.
+// Read-only: it does not build the server, so reading it cannot freeze the
+// configuration. Zero values are returned before the server exists.
 func (self *SocksProxy) Stats() SocksStatsSnapshot {
-	return self.ensureServer().Stats().Snapshot()
+	if server := self.builtServer(); server != nil {
+		return server.Stats().Snapshot()
+	}
+	return SocksStatsSnapshot{}
 }
 
 // Drain begins a graceful drain (PROXYDRAIN1.md §3.2): listeners close while
@@ -113,9 +125,13 @@ func (self *SocksProxy) Drain() {
 	self.ensureServer().drain.Drain()
 }
 
-// ActiveCount reports the number of in-flight connections.
+// ActiveCount reports the number of in-flight connections. Read-only: it does
+// not build the server, so reading it cannot freeze the configuration.
 func (self *SocksProxy) ActiveCount() int {
-	return self.ensureServer().drain.ActiveCount()
+	if server := self.builtServer(); server != nil {
+		return server.drain.ActiveCount()
+	}
+	return 0
 }
 
 // WaitIdle blocks until a drain has begun and no connections are active, or
@@ -124,36 +140,50 @@ func (self *SocksProxy) WaitIdle(ctx context.Context) bool {
 	return self.ensureServer().drain.WaitIdle(ctx)
 }
 
+// builtServer returns the server if it has already been built, or nil. Read-only
+// accessors use this so that reading a counter cannot freeze the configuration.
+func (self *SocksProxy) builtServer() *socksServer {
+	self.serverMu.Lock()
+	defer self.serverMu.Unlock()
+	return self.server
+}
+
 // ensureServer builds the socks5 server on first use. Settings are read here, so
-// a caller may adjust Settings() any time before serving starts.
+// a caller may adjust Settings() any time before the first build.
 func (self *SocksProxy) ensureServer() *socksServer {
 	self.serverOnce.Do(func() {
+		self.serverMu.Lock()
+		defer self.serverMu.Unlock()
 		self.server = self.newServer()
 	})
 	return self.server
 }
 
 // newServer builds the socks5 protocol server. The callbacks recover panics via
-// connect.HandleError, matching the behavior the proxy has always had.
+// connect.HandleError, matching the behavior the proxy has always had. Callback
+// fields (ConnectDialWithRequest, ValidUser) are captured at build time so the
+// configuration freezes atomically with the build; reading them dynamically
+// inside the closures would race a concurrent assignment.
 func (self *SocksProxy) newServer() *socksServer {
 	server := newSocksServer(self.settings)
 	server.Log = self.logger()
+	dial := self.ConnectDialWithRequest
 	server.Dial = func(ctx context.Context, r *Request, network string, addr string) (net.Conn, error) {
 		return connect.HandleError2(func() (net.Conn, error) {
-			return self.ConnectDialWithRequest(ctx, r, network, addr)
+			return dial(ctx, r, network, addr)
 		}, func() (net.Conn, error) {
 			return nil, fmt.Errorf("Unexpected error")
 		})
 	}
-	server.ValidUser = func(user string, password string, userAddr string) bool {
-		if self.ValidUser == nil {
-			return false
+	// nil ValidUser means no-auth allowed, preserving pre-rewrite behavior
+	if validUser := self.ValidUser; validUser != nil {
+		server.ValidUser = func(user string, password string, userAddr string) bool {
+			return connect.HandleError1(func() bool {
+				return validUser(user, password, userAddr)
+			}, func() bool {
+				return false
+			})
 		}
-		return connect.HandleError1(func() bool {
-			return self.ValidUser(user, password, userAddr)
-		}, func() bool {
-			return false
-		})
 	}
 	return server
 }
