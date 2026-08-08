@@ -56,7 +56,7 @@ Usage:
     socksproxy [options]
 
 Options:
-    --addr=<addr>                  socks5 server address (env ADDR, default :9999)
+    --addr=<addr>                  socks5 server address (env ADDR, default 127.0.0.1:9999)
     --api-url=<api-url>            api url (env API_URL, default https://api.bringyour.com)
     --platform-url=<platform-url>  platform url (env PLATFORM_URL, default wss://connect.bringyour.com)
     --user-auth=<user-auth>        user auth, required (env USER_AUTH)
@@ -89,7 +89,7 @@ Options:
 		}
 		return def
 	}
-	cfg.addr = pick("--addr", "ADDR", ":9999")
+	cfg.addr = pick("--addr", "ADDR", "127.0.0.1:9999")
 	cfg.apiURL = pick("--api-url", "API_URL", "https://api.bringyour.com")
 	cfg.platformURL = pick("--platform-url", "PLATFORM_URL", "wss://connect.bringyour.com")
 	cfg.userAuth = pick("--user-auth", "USER_AUTH", "")
@@ -212,22 +212,24 @@ Options:
 		}()
 
 		socksProxy := proxy.NewSocksProxyWithDefaults()
-		// a dev tool: any credentials are accepted
-		socksProxy.ValidUser = func(user string, password string, userAddr string) bool {
-			return true
-		}
 		socksProxy.ConnectDialWithRequest = func(ctx context.Context, r proxy.SocksRequest, network string, addr string) (net.Conn, error) {
 			fmt.Println("Dialing", network, addr, r.DestAddr.FQDN)
 			return dev.DialContext(ctx, network, addr)
 		}
 
-		go socksProxy.ListenAndServe(ctx, "tcp", cfg.addr)
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- socksProxy.ListenAndServe(ctx, "tcp", cfg.addr)
+		}()
 
 		fmt.Printf("socks5 server is listening on %s\n", cfg.addr)
 
-		<-ctx.Done()
-
-		return nil
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-errCh:
+			return err
+		}
 	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
