@@ -54,12 +54,21 @@ type WgTun interface {
 	Cancel()
 }
 
+// Optionally accepts one borrowed packet list. The implementation must copy
+// before returning if its asynchronous send retains packet bytes.
+type WgBatchTun interface {
+	WgTun
+	SendBorrowedBatch([][]byte, int) int
+}
+
 func DefaultWgProxySettings() *WgProxySettings {
 	return &WgProxySettings{
-		ReceiveSequenceSize: 1024,
-		EventsSequenceSize:  16,
-		CheckTunIdleTimeout: 1 * time.Minute,
-		ClientBatchSize:     256,
+		ReceiveSequenceSize:     1024,
+		EventsSequenceSize:      16,
+		CheckTunIdleTimeout:     1 * time.Minute,
+		ClientBatchSize:         256,
+		UploadPacketBatchSize:   8,
+		DownloadPacketBatchSize: 64,
 	}
 }
 
@@ -77,6 +86,10 @@ type WgProxySettings struct {
 	// failing peer drops at most one batch (which is then retried per peer)
 	// rather than the entire set
 	ClientBatchSize int
+	// Maximum borrowed packets handed to one asynchronous Connect upload.
+	UploadPacketBatchSize int
+	// Maximum already-ready packets returned by one WireGuard read.
+	DownloadPacketBatchSize int
 }
 
 // implements wg device:
@@ -734,40 +747,115 @@ func (self *WgProxy) AddEvent(event uwgtun.Event) {
 }
 
 func (self *WgProxy) BatchSize() int {
-	return 1
+	return max(self.uploadPacketBatchSize(), self.downloadPacketBatchSize())
+}
+
+// Resolves the measured directional default to at least one packet.
+func (self *WgProxy) uploadPacketBatchSize() int {
+	return max(1, self.settings.UploadPacketBatchSize)
+}
+
+// Resolves the measured directional default to at least one packet.
+func (self *WgProxy) downloadPacketBatchSize() int {
+	return max(1, self.settings.DownloadPacketBatchSize)
 }
 
 // `uwgtun.Device` implementation
 func (self *WgProxy) Write(bufs [][]byte, offset int) (count int, returnErr error) {
+	if len(bufs) == 0 {
+		return
+	}
+	firstSourceAddr := netip.Addr{}
+	homogeneousSource := true
 	for _, buf := range bufs {
-		packet := buf[offset:]
-		// packet := gopacket.NewPacket(packet, layers.LayerTypeIPv4, gopacket.Default)
-
-		err := func() error {
-			ipPath, err := connect.ParseIpPath(packet)
-			if err != nil {
-				return err
-			}
-			sourceAddr, ok := netip.AddrFromSlice(ipPath.SourceIp)
-			if !ok {
-				return fmt.Errorf("Unknown source ip")
-			}
-			tun, err := self.activateClient(sourceAddr)
-			if err != nil {
-				return err
-			}
-			success := tun.Send(packet)
-			if !success {
-				return DidNotSendError
-			}
-			return nil
-		}()
-
-		if err == nil {
-			count += 1
-		} else {
-			returnErr = errors.Join(returnErr, err)
+		if len(buf) < offset {
+			homogeneousSource = false
+			break
 		}
+		ipPath, err := connect.ParseIpPath(buf[offset:])
+		if err != nil {
+			homogeneousSource = false
+			break
+		}
+		sourceAddr, ok := netip.AddrFromSlice(ipPath.SourceIp)
+		if !ok {
+			homogeneousSource = false
+			break
+		}
+		if !firstSourceAddr.IsValid() {
+			firstSourceAddr = sourceAddr
+		} else if sourceAddr != firstSourceAddr {
+			homogeneousSource = false
+			break
+		}
+	}
+	send := func(sourceAddr netip.Addr, packets [][]byte, packetOffset int) {
+		tun, err := self.activateClient(sourceAddr)
+		if err != nil {
+			returnErr = errors.Join(returnErr, err)
+			return
+		}
+		if batchTun, ok := tun.(WgBatchTun); ok {
+			batchSize := self.uploadPacketBatchSize()
+			for packetStart := 0; packetStart < len(packets); packetStart += batchSize {
+				packetEnd := min(packetStart+batchSize, len(packets))
+				batchPackets := packets[packetStart:packetEnd]
+				sentPacketCount := batchTun.SendBorrowedBatch(batchPackets, packetOffset)
+				count += sentPacketCount
+				if sentPacketCount != len(batchPackets) {
+					returnErr = errors.Join(returnErr, DidNotSendError)
+				}
+			}
+			return
+		}
+		for _, packet := range packets {
+			if tun.Send(packet[packetOffset:]) {
+				count += 1
+			} else {
+				returnErr = errors.Join(returnErr, DidNotSendError)
+			}
+		}
+	}
+	if homogeneousSource && firstSourceAddr.IsValid() {
+		send(firstSourceAddr, bufs, offset)
+		return
+	}
+
+	type borrowedPacketGroup struct {
+		sourceAddr netip.Addr
+		packets    [][]byte
+	}
+	groups := []*borrowedPacketGroup{}
+	sourceAddrGroup := map[netip.Addr]*borrowedPacketGroup{}
+	for _, buf := range bufs {
+		if len(buf) < offset {
+			returnErr = errors.Join(returnErr, fmt.Errorf("packet offset %d exceeds buffer size %d", offset, len(buf)))
+			continue
+		}
+		packet := buf[offset:]
+		ipPath, err := connect.ParseIpPath(packet)
+		if err != nil {
+			returnErr = errors.Join(returnErr, err)
+			continue
+		}
+		sourceAddr, ok := netip.AddrFromSlice(ipPath.SourceIp)
+		if !ok {
+			returnErr = errors.Join(returnErr, fmt.Errorf("unknown source ip"))
+			continue
+		}
+		group := sourceAddrGroup[sourceAddr]
+		if group == nil {
+			group = &borrowedPacketGroup{
+				sourceAddr: sourceAddr,
+				packets:    make([][]byte, 0, len(bufs)),
+			}
+			sourceAddrGroup[sourceAddr] = group
+			groups = append(groups, group)
+		}
+		group.packets = append(group.packets, packet)
+	}
+	for _, group := range groups {
+		send(group.sourceAddr, group.packets, 0)
 	}
 	return
 }
@@ -775,21 +863,40 @@ func (self *WgProxy) Write(bufs [][]byte, offset int) (count int, returnErr erro
 // `uwgtun.Device` implementation
 // note that `userwireguard` does not use `connect.MessagPool*`
 func (self *WgProxy) Read(bufs [][]byte, sizes []int, offset int) (count int, returnErr error) {
-	select {
-	case <-self.ctx.Done():
-		return 0, fmt.Errorf("Done.")
-	case packet := <-self.receive:
-		// ownership transferred to us on the successful send; copy into the
-		// device buffer and return the shared packet to the pool.
-		n := copy(bufs[0][offset:], packet)
+	maximumPacketCount := min(len(bufs), len(sizes), self.downloadPacketBatchSize())
+	if maximumPacketCount == 0 {
+		return 0, PacketTooLargeError
+	}
+	for _, buf := range bufs[:maximumPacketCount] {
+		if len(buf) < offset {
+			return 0, PacketTooLargeError
+		}
+	}
+	copyPacket := func(packet []byte) {
+		n := copy(bufs[count][offset:], packet)
 		connect.MessagePoolReturn(packet)
 		if n < len(packet) {
 			returnErr = errors.Join(returnErr, PacketTooLargeError)
 		}
-		sizes[0] = n
+		sizes[count] = n
 		count += 1
-		return
 	}
+
+	select {
+	case <-self.ctx.Done():
+		return 0, fmt.Errorf("done")
+	case packet := <-self.receive:
+		copyPacket(packet)
+	}
+	for count < maximumPacketCount {
+		select {
+		case packet := <-self.receive:
+			copyPacket(packet)
+		default:
+			return
+		}
+	}
+	return
 }
 
 // `uwgtun.Device` implementation
