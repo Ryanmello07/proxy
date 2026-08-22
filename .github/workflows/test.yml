@@ -12,6 +12,14 @@ on:
 permissions:
   contents: read
 
+# connect/test.yml and sdk/test.yml (the two oldest) set no concurrency group,
+# so a busy branch stacks runs there. server/test.yml and linux/build.yml (the
+# two newest) do, and this follows the newer habit: a superseded run is
+# cancelled rather than left burning a runner for a commit nobody will look at.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: go test
@@ -51,9 +59,17 @@ jobs:
           go-version-file: proxy/go.mod
           cache-dependency-path: proxy/go.sum
 
+      # Builds the library and the socks command in one pass -- socks/ is a main
+      # package inside this same module, not a separate one.
       - name: Build
         working-directory: proxy
         run: go build ./...
+
+      # Cheap, and it catches the class of mistake a compile does not: lost
+      # cancels, copied locks, printf mismatches. server/test.yml runs it too.
+      - name: Vet
+        working-directory: proxy
+        run: go vet ./...
 
       # -count=1 defeats the test result cache so a green run always means the
       # tests actually ran. The suite needs no privileges and no external
