@@ -68,10 +68,15 @@ type HttpProxySettings struct {
 
 func DefaultHttpProxySettings() *HttpProxySettings {
 	return &HttpProxySettings{
-		ProxyReadTimeout:         30 * time.Second,
-		ProxyWriteTimeout:        15 * time.Second,
-		ProxyIdleTimeout:         5 * time.Minute,
-		ProxyConnectTimeout:      30 * time.Minute,
+		ProxyReadTimeout:  30 * time.Second,
+		ProxyWriteTimeout: 15 * time.Second,
+		ProxyIdleTimeout:  5 * time.Minute,
+		// A CONNECT retries for the lifetime of the client. Pace transient dial
+		// failures, but retry soon enough to recover inside ordinary client
+		// request deadlines. The previous 30-minute value came from the old
+		// timeout semantics; after this field became a retry interval, one
+		// recoverable dial error effectively became terminal for every client.
+		ProxyConnectTimeout:      minProxyConnectTimeout,
 		ProxyTlsHandshakeTimeout: 30 * time.Second,
 		MaxHttpBodyBytes:         2 * 1024 * 1024,
 		StatsLogInterval:         DefaultStatsLogInterval,

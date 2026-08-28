@@ -201,7 +201,6 @@ func TestConnectRetrySucceedsAfterUpstreamComesUp(t *testing.T) {
 
 	var attempts atomic.Int64
 	proxy := NewHttpProxy(testHttpSettings())
-	proxy.Settings().ProxyConnectTimeout = minProxyConnectTimeout
 	proxy.ConnectDialWithRequest = func(r *http.Request, network string, addr string) (net.Conn, error) {
 		if attempts.Add(1) < 3 {
 			return nil, fmt.Errorf("connection refused")
