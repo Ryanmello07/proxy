@@ -88,6 +88,14 @@ type HttpProxy struct {
 	stats    HttpStats
 	drain    drainState
 
+	// ConnectDialContextWithRequest is preferred over ConnectDialWithRequest.
+	// The explicit context is the complete lifetime of this proxy attempt: for a
+	// hijacked CONNECT it is canceled when the raw client connection closes, which
+	// r.Context alone cannot observe after net/http hands ownership to the proxy.
+	ConnectDialContextWithRequest func(ctx context.Context, r *http.Request, network string, addr string) (net.Conn, error)
+	// ConnectDialWithRequest remains for callers that have not migrated to the
+	// context-aware callback. New callers should use ConnectDialContextWithRequest
+	// so an in-flight dial cannot outlive the client that requested it.
 	ConnectDialWithRequest func(r *http.Request, network string, addr string) (net.Conn, error)
 	GetTlsConfigForClient  func(*tls.ClientHelloInfo) (*tls.Config, error)
 }
@@ -104,6 +112,16 @@ func NewHttpProxyWithDefaults() *HttpProxy {
 
 func (self *HttpProxy) Settings() *HttpProxySettings {
 	return self.settings
+}
+
+func (self *HttpProxy) connectDial(ctx context.Context, r *http.Request, network string, addr string) (net.Conn, error) {
+	if self.ConnectDialContextWithRequest != nil {
+		return self.ConnectDialContextWithRequest(ctx, r, network, addr)
+	}
+	if self.ConnectDialWithRequest != nil {
+		return self.ConnectDialWithRequest(r, network, addr)
+	}
+	return nil, fmt.Errorf("ConnectDialContextWithRequest is not configured")
 }
 
 // Stats returns the http data path's counters. Nothing on that path logs — a
@@ -360,7 +378,7 @@ func (self *HttpProxy) handleHttps(w http.ResponseWriter, r *http.Request) {
 	var proxyConn net.Conn
 	for {
 		reconnect := connect.NewPacedReconnect(self.proxyConnectTimeout())
-		proxyConn, err = self.ConnectDialWithRequest(r, "tcp", r.URL.Host)
+		proxyConn, err = self.connectDial(handleCtx, r, "tcp", r.URL.Host)
 		if err == nil {
 			break
 		}
@@ -425,9 +443,9 @@ func (self *HttpProxy) handleHttp(w http.ResponseWriter, r *http.Request) {
 	var dialFailed atomic.Bool
 
 	tr := &http.Transport{
-		Dial: func(network string, addr string) (net.Conn, error) {
+		DialContext: func(ctx context.Context, network string, addr string) (net.Conn, error) {
 			return connect.HandleError2(func() (net.Conn, error) {
-				conn, err := self.ConnectDialWithRequest(r, network, addr)
+				conn, err := self.connectDial(ctx, r, network, addr)
 				if err != nil {
 					dialFailed.Store(true)
 				}

@@ -193,6 +193,82 @@ func TestConnectRetryExitsWhenClientDrops(t *testing.T) {
 	}
 }
 
+// TestConnectInFlightDialCanceledWhenClientDrops covers the cancellation gap
+// inside an individual dial attempt. The retry loop already observed the
+// CONNECT lifetime, but the legacy callback received only r.Context. After a
+// hijack net/http cannot cancel that context when the raw client disappears, so
+// a slow DeviceLocal dial survived until its own timeout on every abandoned
+// request.
+func TestConnectInFlightDialCanceledWhenClientDrops(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	proxy := NewHttpProxy(testHttpSettings())
+	proxy.ConnectDialContextWithRequest = func(ctx context.Context, r *http.Request, network string, addr string) (net.Conn, error) {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		return nil, ctx.Err()
+	}
+	proxyAddr, stop := startHttpProxy(t, proxy)
+	defer stop()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	if _, err := fmt.Fprintf(conn, "CONNECT blocked.test:443 HTTP/1.1\r\nHost: blocked.test:443\r\n\r\n"); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not start upstream dial")
+	}
+	conn.Close()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight CONNECT dial was not canceled when the client closed")
+	}
+}
+
+// TestHttpInFlightDialCanceledWhenClientDrops proves the same lifetime reaches
+// the ordinary HTTP transport. Using Transport.Dial loses the RoundTrip
+// context; DialContext is required for an abandoned request to stop a blocked
+// data-plane dial promptly.
+func TestHttpInFlightDialCanceledWhenClientDrops(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	proxy := NewHttpProxy(testHttpSettings())
+	proxy.ConnectDialContextWithRequest = func(ctx context.Context, r *http.Request, network string, addr string) (net.Conn, error) {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		return nil, ctx.Err()
+	}
+	proxyAddr, stop := startHttpProxy(t, proxy)
+	defer stop()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	if _, err := fmt.Fprintf(conn, "GET http://blocked.test/path HTTP/1.1\r\nHost: blocked.test\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not start upstream dial")
+	}
+	conn.Close()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight HTTP dial was not canceled when the client closed")
+	}
+}
+
 // TestConnectRetrySucceedsAfterUpstreamComesUp checks the retry loop still does
 // its job: it must keep retrying a failing dial for as long as the client is
 // there, which is the whole point of the loop.
