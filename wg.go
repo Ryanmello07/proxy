@@ -147,6 +147,14 @@ type WgProxy struct {
 	closeActiveClientsOnce sync.Once
 }
 
+// WgRuntimeStats is process-local receive health without peer identity. The
+// values are cumulative for one WireGuard device generation.
+type WgRuntimeStats struct {
+	InboundPeerQueueDropPacketCount       uint64
+	InboundDecryptionQueueDropPacketCount uint64
+	ReceiveRoutineFailureCount            uint64
+}
+
 type wgTunDevice struct {
 	proxy *WgProxy
 }
@@ -460,6 +468,15 @@ func (self *WgProxy) ClientCount() int {
 	self.stateLock.RLock()
 	defer self.stateLock.RUnlock()
 	return len(self.clients)
+}
+
+// RuntimeStats exposes the shared UDP receive boundary for server metrics.
+func (self *WgProxy) RuntimeStats() WgRuntimeStats {
+	return WgRuntimeStats{
+		InboundPeerQueueDropPacketCount:       self.device.InboundPeerQueueDropPacketCount(),
+		InboundDecryptionQueueDropPacketCount: self.device.InboundDecryptionQueueDropPacketCount(),
+		ReceiveRoutineFailureCount:            self.device.ReceiveRoutineFailureCount(),
+	}
 }
 
 // WgPeerStatus is a registered client's live peer session facts: the endpoint

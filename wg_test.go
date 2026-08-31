@@ -18,6 +18,20 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
+func TestWgProxyRuntimeStatsStartAtZero(t *testing.T) {
+	wg := NewWgProxy(context.Background(), DefaultWgProxySettings())
+	t.Cleanup(func() {
+		_ = wg.Close()
+	})
+
+	stats := wg.RuntimeStats()
+	if stats.InboundPeerQueueDropPacketCount != 0 ||
+		stats.InboundDecryptionQueueDropPacketCount != 0 ||
+		stats.ReceiveRoutineFailureCount != 0 {
+		t.Fatalf("initial runtime stats = %+v, want zero", stats)
+	}
+}
+
 func TestWgProxyWithUserspaceWireGuardClient(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
