@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/urnetwork/connect"
 )
 
 // Capacity: how many concurrent clients actually fit in a memory budget?
@@ -81,7 +83,7 @@ func runCapacityChild(role string) {
 			servedAddrs = append(servedAddrs, ln.Addr().String())
 			ln.Close()
 		}
-	} else if role != "wg" {
+	} else if role != "wg" && role != "wgup" && role != "wgup8g" {
 		for i := 0; i < capacityPorts; i += 1 {
 			servedAddrs = append(servedAddrs, capacitySocketPath("proxy", os.Getpid(), i))
 		}
@@ -135,7 +137,11 @@ func runCapacityChild(role string) {
 			os.Remove(addr)
 			go proxy.ListenAndServe(ctx, "unix", addr)
 		}
-	case "wg":
+	case "wg", "wgup", "wgup8g":
+		if role == "wgup8g" {
+			packetBytes := connect.ByteCount(memoryBudget / 3)
+			connect.ResizeMessagePools(packetBytes, connect.ByteCount(memoryBudget)-packetBytes)
+		}
 		settings := DefaultWgProxySettings()
 		privateKey, _, err := WgGenKeyPairStrings()
 		if err != nil {
@@ -145,6 +151,12 @@ func runCapacityChild(role string) {
 		settings.PrivateKey = privateKey
 		wgProxy = NewWgProxy(ctx, settings)
 		defer wgProxy.Close()
+		if role == "wgup" || role == "wgup8g" {
+			if err := startCapacityWgDevice(wgProxy); err != nil {
+				fmt.Println("ERR", err)
+				return
+			}
+		}
 	default:
 		fmt.Println("ERR unknown role", role)
 		return
@@ -179,10 +191,47 @@ func runCapacityChild(role string) {
 			n, _ := strconv.Atoi(fields[1])
 			addWgCapacityClients(wgProxy, n)
 			fmt.Println("OK")
+		case "HANDSHAKES":
+			// wgup only: seed every registered peer with an endpoint and
+			// exercise the same server-initiated handshake state used by the
+			// deployment endpoint handoff.
+			seeded, initiated := initiateWgCapacityHandshakes(wgProxy)
+			fmt.Printf("OK %d %d\n", seeded, initiated)
 		case "QUIT":
 			return
 		default:
 			fmt.Println("OK")
+		}
+	}
+}
+
+// startCapacityWgDevice brings up the same server-side WireGuard device used in
+// production. ListenAndServe blocks for the device lifetime, so readiness must
+// be established independently before the child accepts peer commands.
+func startCapacityWgDevice(wgProxy *WgProxy) error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- wgProxy.ListenAndServe("127.0.0.1", "", 0)
+	}()
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		dev, err := wgProxy.device.IpcGet()
+		if err == nil && dev.ListenPort != 0 {
+			return nil
+		}
+		select {
+		case err := <-errCh:
+			if err == nil {
+				return fmt.Errorf("wireguard device stopped before readiness")
+			}
+			return err
+		case <-ticker.C:
+		case <-deadline.C:
+			return fmt.Errorf("wireguard device did not become ready")
 		}
 	}
 }
@@ -207,6 +256,21 @@ func addWgCapacityClients(wgProxy *WgProxy, n int) {
 		}
 	}
 	wgProxy.AddClients(clients)
+}
+
+func initiateWgCapacityHandshakes(wgProxy *WgProxy) (seeded int, initiated int) {
+	endpoint := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+	endpoints := map[netip.Addr]*net.UDPAddr{}
+	for addr := range wgProxy.Clients() {
+		endpoints[addr] = endpoint
+	}
+	seeded, _ = wgProxy.SeedEndpoints(endpoints)
+	for addr := range endpoints {
+		if wgProxy.InitiateHandshake(addr) == nil {
+			initiated++
+		}
+	}
+	return
 }
 
 // --- parent process: drives the child and measures it ------------------------
@@ -303,6 +367,19 @@ func (self *capacityChild) command(t *testing.T, cmd string) []string {
 		t.Fatalf("read reply to %q: %v", cmd, err)
 	}
 	return strings.Fields(line)
+}
+
+func (self *capacityChild) goroutines(t *testing.T) int64 {
+	t.Helper()
+	stats := self.command(t, "STATS")
+	if len(stats) != 5 || stats[0] != "OK" {
+		t.Fatalf("STATS reply = %q, want OK <heap> <stack> <sys> <goroutines>", stats)
+	}
+	count, err := strconv.ParseInt(stats[4], 10, 64)
+	if err != nil {
+		t.Fatalf("parse goroutine count %q: %v", stats[4], err)
+	}
+	return count
 }
 
 // rss reads the child's resident set size in bytes. This is what a cgroup memory
@@ -494,10 +571,11 @@ func TestCapacityHttpConnect(t *testing.T) {
 
 // --- WireGuard peers ---------------------------------------------------------
 
-// TestCapacityWgPeers measures REGISTERED peers: the device peer plus the proxy's
-// bookkeeping. It deliberately does not activate a tun, because an active client's
-// tun is a gVisor netstack owned by `connect`, not by this package — that cost is
-// per-ACTIVE-client and has to be sized separately.
+// TestCapacityWgPeers measures peers registered on a DOWN WireGuard device. This
+// isolates the peer structs and proxy bookkeeping, but it is not the production
+// steady state: ListenAndServe brings the server device up and starts two ordering
+// routines for every registered peer. Active client gVisor netstacks remain a
+// separate per-active-client cost owned by connect.
 func TestCapacityWgPeers(t *testing.T) {
 	skipUnlessCapacity(t)
 	child := startCapacityChild(t, "wg", "")
@@ -510,7 +588,84 @@ func TestCapacityWgPeers(t *testing.T) {
 		rss, heap, stack, goroutines := child.sample(t)
 		steps = append(steps, capacityStep{registered, rss, heap, stack, goroutines})
 	}
-	report(t, "wireguard (registered peers, no active tun)", steps)
+	report(t, "wireguard (registered peers, device down)", steps)
+}
+
+// TestWgCapacityModelStartsProductionPeerRoutines is a small, normal-suite guard
+// against accidentally sizing only a down WireGuard device again. The child is
+// isolated from the test runner, and no client tunnel is activated; the only
+// durable goroutine change is the sender and receiver routine for each peer.
+func TestWgCapacityModelStartsProductionPeerRoutines(t *testing.T) {
+	child := startCapacityChild(t, "wgup", "")
+	base := child.goroutines(t)
+
+	const peers = 64
+	child.command(t, fmt.Sprintf("PEERS %d", peers))
+	got := child.goroutines(t) - base
+	if got != 2*peers {
+		t.Fatalf("adding %d peers to an up device added %d goroutines, want %d", peers, got, 2*peers)
+	}
+}
+
+// TestCapacityWgUpPeers measures the production registered-peer shape: the
+// server device is listening and each peer's sequential sender and receiver are
+// running. It still excludes the connect-owned gVisor netstack for active clients.
+func TestCapacityWgUpPeers(t *testing.T) {
+	skipUnlessCapacity(t)
+	child := startCapacityChild(t, "wgup", "")
+
+	steps := []capacityStep{}
+	registered := 0
+	for _, target := range []int{2000, 5000, 10000, 20000} {
+		child.command(t, fmt.Sprintf("PEERS %d", target-registered))
+		registered = target
+		rss, heap, stack, goroutines := child.sample(t)
+		steps = append(steps, capacityStep{registered, rss, heap, stack, goroutines})
+	}
+	report(t, "wireguard (registered peers, device up)", steps)
+}
+
+// TestCapacityWgHandshakePeers extends the up-device control through the
+// deployment handoff's endpoint seed and server-initiated handshake. Idle,
+// never-handshaken peers are not a sufficient negative control for a fleet
+// whose replacement generation actively restores peer sessions.
+func TestCapacityWgHandshakePeers(t *testing.T) {
+	skipUnlessCapacity(t)
+	child := startCapacityChild(t, "wgup", "")
+
+	steps := []capacityStep{}
+	registered := 0
+	for _, target := range []int{2000, 5000, 10000, 20000} {
+		child.command(t, fmt.Sprintf("PEERS %d", target-registered))
+		registered = target
+		reply := child.command(t, "HANDSHAKES")
+		if len(reply) != 3 || reply[0] != "OK" {
+			t.Fatalf("HANDSHAKES reply=%q, want OK <seeded> <initiated>", reply)
+		}
+		time.Sleep(time.Second)
+		rss, heap, stack, goroutines := child.sample(t)
+		steps = append(steps, capacityStep{registered, rss, heap, stack, goroutines})
+	}
+	report(t, "wireguard (endpoint-seeded handshaking peers)", steps)
+}
+
+// TestCapacityWgConfiguredPoolPeers includes the server executable's 8 GiB
+// logical Connect message-pool limit. Capacity must remain lazy: an empty
+// free-list ceiling must not allocate a dense buffer or metadata index at
+// startup, and therefore must not explain a multi-gigabyte peer-sync floor.
+func TestCapacityWgConfiguredPoolPeers(t *testing.T) {
+	skipUnlessCapacity(t)
+	child := startCapacityChild(t, "wgup8g", "")
+
+	steps := []capacityStep{}
+	registered := 0
+	for _, target := range []int{2000, 5000, 10000, 20000} {
+		child.command(t, fmt.Sprintf("PEERS %d", target-registered))
+		registered = target
+		rss, heap, stack, goroutines := child.sample(t)
+		steps = append(steps, capacityStep{registered, rss, heap, stack, goroutines})
+	}
+	report(t, "wireguard (up peers, 8 GiB logical message-pool ceiling)", steps)
 }
 
 // --- tunnel openers ----------------------------------------------------------
