@@ -34,8 +34,8 @@ func TestTestScriptAcquiresNetworkSuiteGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := string(contentBytes)
-	gateIndex := strings.Index(content, `exec "$network_test_gate" run-all-proxy`)
-	verifyIndex := strings.Index(content, `"$network_test_gate" --verify-held`)
+	gateIndex := strings.Index(content, `exec "$network_test_gate" run-all run-all-proxy`)
+	verifyIndex := strings.Index(content, `"$network_test_gate" --verify-held run-all`)
 	discoveryIndex := strings.Index(content, "for d in `find .")
 	if gateIndex < 0 || verifyIndex < 0 || discoveryIndex < 0 {
 		t.Fatalf("gate/discovery locations = %d/%d/%d; want all present", gateIndex, verifyIndex, discoveryIndex)
